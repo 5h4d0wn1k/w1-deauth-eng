@@ -1,57 +1,78 @@
 #!/usr/bin/env python3
-"""W1 — Deauth/PMF Resilience Analysis & Deauth IDS
+"""W1 — Deauth/Disassociation Engineering & Analysis.
 
-802.11 management-frame deauth/disassociation analysis toolkit.
-Parses deauth/disassoc frame dumps, applies spoof-heuristics detection,
-builds a PMF resilience matrix, and categorizes respReq protections.
+Byte-level 802.11 deauth/disassoc frame *builder* + *parser* with
+spoof-heuristics detection and a PMF resilience matrix. All frame work
+happens offscreen with pure-stdlib bytes (frame_core); no radio emitted.
+
+Safety: destructive/emission actions are OFF by default. Real-air
+capability is a future hardware gate and is not implemented here.
 """
 
-import struct
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
 import time
-import hashlib
-from collections import defaultdict, Counter
+from collections import defaultdict
 
-# ---------------------------------------------------------------------------
-# Embedded sample 802.11 deauth / disassociation frames (hex-encoded)
-# Each entry: (hex_bytes, label_for_demo)
-# Frame format: 2-byte control + 2-byte duration + 6-byte dst + 6-byte src
-#              + 6-byte bssid + 2-byte seqctl + 2-byte reason_code
-# ---------------------------------------------------------------------------
+try:
+    from firmware import frame_core as fc
+except ImportError:
+    try:
+        import frame_core as fc
+    except ImportError:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "firmware"))
+        import frame_core as fc
 
-SAMPLE_FRAMES = [
-    {"label": "deauth-directed-1", "hex": "c0003a00ffffffffffff112233445566aabbccddeeff10000700", "ts": 1700000000.0},
-    {"label": "deauth-directed-2", "hex": "c0003a00ffffffffffff112233445577aabbccddeeff20000800", "ts": 1700000000.05},
-    {"label": "deauth-broadcast",  "hex": "c0003a00ffffffffffffaabbccddeeffaabbccddeeff30000900", "ts": 1700000000.1},
-    {"label": "disassoc-directed", "hex": "a0003a00ffffffffffff112233445566aabbccddeeff40000a00", "ts": 1700000001.0},
-    {"label": "deauth-flood-1", "hex": "c0003a00ffffffffffff112233445566aabbccddeeff50000700", "ts": 1700000002.0},
-    {"label": "deauth-flood-2", "hex": "c0003a00ffffffffffff112233445566aabbccddeeff60000700", "ts": 1700000002.02},
-    {"label": "deauth-flood-3", "hex": "c0003a00ffffffffffff112233445566aabbccddeeff70000700", "ts": 1700000002.04},
-    {"label": "deauth-flood-4", "hex": "c0003a00ffffffffffff112233445566aabbccddeeff80000700", "ts": 1700000002.06},
-    {"label": "deauth-flood-5", "hex": "c0003a00ffffffffffff112233445566aabbccddeeff90000700", "ts": 1700000002.08},
-    {"label": "deauth-flood-6", "hex": "c0003a00ffffffffffff112233445566aabbccddeeffa0000700", "ts": 1700000002.10},
-    {"label": "deauth-spoofed-mac", "hex": "c0003a00ffffffffffffaabbccddeeff001133445566b0000700", "ts": 1700000005.0},
-    {"label": "deauth-normal", "hex": "c0003a00ffffffffffff334455667788aabbccddeeffc0000100", "ts": 1700000010.0},
-]
+# ----------------------------------------------------------------------
+# Embedded showcase frames (built with the byte-level builder, then parsed)
+# ----------------------------------------------------------------------
 
-# Reason codes per IEEE 802.11-2020 Table 9-45
-REASON_CODES = {
-    1: "Unspecified",
-    2: "Previous authentication no longer valid",
-    3: "Deauthenticated because sending STA is leaving (or has left)",
-    4: "Disassociated due to inactivity",
-    5: "Disassociated because sending STA is leaving (or has left) BSS",
-    6: "STA request (re)association but is not authenticated",
-    7: "Information element in disassoc/deauth frame not acceptable",
-    8: "Information element in disassoc/deauth frame not acceptable",
-    14: "MIC failure",
-    15: "4-way handshake timeout",
-    16: "Group key handshake timeout",
-    17: "Information element in 4-way handshake not acceptable",
-    34: "Disassociated due to low ACK",
-}
 
-# PMF resilience matrix: maps AP security posture to deauth resilience
-# respReq values: 0 = optional, 1 = required
+def build_showcase_frames() -> list[dict]:
+    """Build a deterministic set of deauth/disassoc frames using frame_core."""
+    lab_ap = "00:11:22:33:44:55"
+    lab_client = "00:11:22:33:44:66"
+    lab_client2 = "00:11:22:33:44:77"
+    evasive_mac = "02:11:22:33:44:99"   # locally-administered bit (0x02) set
+
+    entries = [
+        {"label": "deauth-directed-1", "data": fc.build_deauth(
+            lab_client, lab_ap, lab_ap, reason=7, seq_num=8), "ts": 1700000000.0},
+        {"label": "deauth-directed-2", "data": fc.build_deauth(
+            lab_client, lab_ap, lab_ap, reason=8, seq_num=9), "ts": 1700000000.05},
+        {"label": "deauth-broadcast", "data": fc.build_deauth(
+            fc.BROADCAST_STR, lab_ap, lab_ap, reason=9, seq_num=10), "ts": 1700000000.1},
+        {"label": "disassoc-directed", "data": fc.build_disassoc(
+            lab_client, lab_ap, lab_ap, reason=10, seq_num=11), "ts": 1700000001.0},
+        {"label": "deauth-flood-1", "data": fc.build_deauth(
+            lab_client, lab_ap, lab_ap, reason=7, seq_num=12), "ts": 1700000002.0},
+        {"label": "deauth-flood-2", "data": fc.build_deauth(
+            lab_client, lab_ap, lab_ap, reason=7, seq_num=13), "ts": 1700000002.02},
+        {"label": "deauth-flood-3", "data": fc.build_deauth(
+            lab_client, lab_ap, lab_ap, reason=7, seq_num=14), "ts": 1700000002.04},
+        {"label": "deauth-flood-4", "data": fc.build_deauth(
+            lab_client, lab_ap, lab_ap, reason=7, seq_num=15), "ts": 1700000002.06},
+        {"label": "deauth-flood-5", "data": fc.build_deauth(
+            lab_client, lab_ap, lab_ap, reason=7, seq_num=16), "ts": 1700000002.08},
+        {"label": "deauth-flood-6", "data": fc.build_deauth(
+            lab_client, lab_ap, lab_ap, reason=7, seq_num=17), "ts": 1700000002.10},
+        {"label": "deauth-randomized-sa-1", "data": fc.build_deauth(
+            lab_client, evasive_mac, lab_ap, reason=7, seq_num=20), "ts": 1700000005.0},
+        {"label": "deauth-randomized-sa-2", "data": fc.build_deauth(
+            lab_client2, evasive_mac, lab_ap, reason=7, seq_num=21), "ts": 1700000005.3},
+        {"label": "deauth-normal", "data": fc.build_deauth(
+            lab_client, lab_ap, lab_ap, reason=1, seq_num=30), "ts": 1700000010.0},
+    ]
+    for e in entries:
+        e["data"] += fc.fcs(e["data"])          # append FCS
+    return entries
+
+
+# PMF resilience matrix (IEEE 802.11-2020 802.11w / SAE posture)
 PMF_MATRIX = {
     "Open (no encryption)": {"pmf": "none", "resilience": "None", "respReq": 0},
     "WPA2-PSK (no PMF)": {"pmf": "optional", "resilience": "Low", "respReq": 0},
@@ -64,198 +85,191 @@ PMF_MATRIX = {
 }
 
 
-def hex_to_bytes(h):
-    """Convert hex string to bytes."""
-    return bytes.fromhex(h)
+def parse_deauth_frame(data: bytes) -> dict:
+    """Parse deauth or disassoc bytes via frame_core."""
+    if len(data) >= 4 and fc.verify_fcs(data):
+        data = data[:-4]
+    fc_info, _rest = fc.parse_mgmt_header(data)
+    subtype = fc_info["subtype_val"]
+    if subtype == fc.FC_SUBTYPE_DEAUTH:
+        parsed = fc.parse_deauth(data)
+        parsed["kind"] = "deauth"
+    elif subtype == fc.FC_SUBTYPE_DISASSOC:
+        parsed = fc.parse_disassoc(data)
+        parsed["kind"] = "disassoc"
+    else:
+        raise ValueError(f"not a deauth/disassoc frame (subtype={subtype})")
+    parsed["is_broadcast"] = fc_info["is_broadcast"]
+    parsed["locally_administered_sa"] = fc_info["locally_administered_sa"]
+    return parsed
 
 
-def parse_mgmt_frame(frame_bytes):
-    """Parse a minimal 802.11 management frame (deauth/disassoc).
-
-    Returns dict with parsed fields or None on error.
-    """
-    if len(frame_bytes) < 24:
-        return None
-    frame_ctrl = struct.unpack("<H", frame_bytes[0:2])[0]
-    subtype = (frame_ctrl >> 4) & 0x0F
-    if subtype not in (0x0C, 0x0A):  # deauth=12, disassoc=10
-        return None
-    duration = struct.unpack("<H", frame_bytes[2:4])[0]
-    dst_mac = frame_bytes[4:10]
-    src_mac = frame_bytes[10:16]
-    bssid = frame_bytes[16:22]
-    seqctl = struct.unpack("<H", frame_bytes[22:24])[0]
-    seq_num = (seqctl >> 4) & 0xFFF
-    frag_num = seqctl & 0x0F
-    reason_code = None
-    if len(frame_bytes) >= 26:
-        reason_code = struct.unpack("<H", frame_bytes[24:26])[0]
-    subtype_name = "deauth" if subtype == 0x0C else "disassoc"
-    return {
-        "subtype": subtype_name,
-        "subtype_val": subtype,
-        "duration": duration,
-        "dst_mac": dst_mac.hex(":"),
-        "src_mac": src_mac.hex(":"),
-        "bssid": bssid.hex(":"),
-        "seq_num": seq_num,
-        "frag_num": frag_num,
-        "reason_code": reason_code,
-        "reason_text": REASON_CODES.get(reason_code, f"Unknown ({reason_code})"),
-        "is_broadcast": dst_mac == b"\xff" * 6,
-        "raw_len": len(frame_bytes),
-    }
-
-
-def detect_spoof_heuristics(parsed_frames):
-    """Apply spoof-heuristics to parsed frames.
-
-    Checks:
-    1. Source-MAC randomization indicators (locally-administered bit)
-    2. Flood-rate detection (too many frames from same src in short window)
-    3. Broadcast vs directed deauth ratio
-    """
+def analyze(parsed_frames: list[dict]) -> dict:
+    """Spoof-heuristic analysis: flood rate, randomized SA, broadcast ratio."""
     alerts = []
     src_rates = defaultdict(list)
-    broadcast_count = 0
-    directed_count = 0
-    loc_admin_frames = 0
+    broadcast = 0
+    directed = 0
+    loc_admin = 0
     total = len(parsed_frames)
 
     for fr in parsed_frames:
-        src = fr["src_mac"]
-        octets = [int(x, 16) for x in src.split(":")]
-        if octets[0] & 0x02:
-            loc_admin_frames += 1
-            alerts.append({
-                "type": "randomized_mac",
-                "frame_src": src,
-                "detail": "Locally-administered bit set in source MAC (randomization indicator)",
-            })
-        if fr["is_broadcast"]:
-            broadcast_count += 1
-        else:
-            directed_count += 1
+        src = fr["sa"]
         src_rates[src].append(fr.get("ts", 0))
+        if fr["is_broadcast"]:
+            broadcast += 1
+        else:
+            directed += 1
+        if fr["locally_administered_sa"]:
+            loc_admin += 1
+            alerts.append({
+                "type": "randomized_mac", "src": src,
+                "detail": "Locally-administered bit set in source MAC",
+            })
 
-    # Flood-rate detection: >5 frames from same src within 1 second
-    for src, timestamps in src_rates.items():
-        timestamps.sort()
-        for i in range(len(timestamps)):
-            window = [t for t in timestamps if 0 <= t - timestamps[i] <= 1.0]
+    for src, times in src_rates.items():
+        times.sort()
+        for i in range(len(times)):
+            window = [t for t in times if 0 <= t - times[i] <= 1.0]
             if len(window) > 5:
                 alerts.append({
-                    "type": "flood_rate",
-                    "frame_src": src,
-                    "count": len(window),
-                    "window_sec": 1.0,
+                    "type": "flood_rate", "src": src, "count": len(window),
                     "detail": f"{len(window)} frames from {src} in 1.0s window (threshold: 5)",
                 })
                 break
 
-    if total > 0:
-        bc_ratio = broadcast_count / total
-        if bc_ratio > 0.5:
-            alerts.append({
-                "type": "broadcast_heavy",
-                "broadcast_count": broadcast_count,
-                "ratio": round(bc_ratio, 2),
-                "detail": f"High broadcast deauth ratio: {broadcast_count}/{total} ({bc_ratio:.0%})",
-            })
+    if total and broadcast / total > 0.5:
+        alerts.append({
+            "type": "broadcast_heavy", "broadcast": broadcast, "total": total,
+            "detail": f"High broadcast deauth ratio: {broadcast}/{total} ({broadcast/total:.0%})",
+        })
 
     return {
         "total_frames": total,
         "unique_sources": len(src_rates),
-        "broadcast_count": broadcast_count,
-        "directed_count": directed_count,
-        "locally_administered_count": loc_admin_frames,
+        "broadcast_count": broadcast,
+        "directed_count": directed,
+        "locally_administered_count": loc_admin,
         "alerts": alerts,
     }
 
 
-def build_pmf_matrix():
-    """Build the PMF resilience matrix for reporting."""
+def build_pmf_matrix() -> dict:
     return PMF_MATRIX
 
 
-def categorize_resp_req(matrix):
-    """Categorize respReq (management frame protection requirement) levels."""
-    categories = {"required": [], "optional": [], "none": []}
+def categorize_resp_req(matrix: dict) -> dict:
+    cats = {"required": [], "optional": [], "none": []}
     for posture, info in matrix.items():
-        req = info["respReq"]
-        if req == 1:
-            categories["required"].append(posture)
+        if info["respReq"] == 1:
+            cats["required"].append(posture)
         elif info["pmf"] == "optional":
-            categories["optional"].append(posture)
+            cats["optional"].append(posture)
         else:
-            categories["none"].append(posture)
-    return categories
+            cats["none"].append(posture)
+    return cats
 
 
-def run_demo():
-    """Run offline demo with embedded sample frames."""
-    print("=" * 65)
-    print("W1 — Deauth/PMF Resilience Analysis & Deauth IDS")
-    print("=" * 65)
+def run_analysis(frames: list[dict], matrix: dict) -> dict:
+    parsed = []
+    for e in frames:
+        try:
+            p = parse_deauth_frame(e["data"])
+            p["ts"] = e["ts"]
+            p["label"] = e["label"]
+            parsed.append(p)
+        except ValueError:
+            continue
+    analysis = analyze(parsed)
+    resp = categorize_resp_req(matrix)
+    return {
+        "name": "w1-deauth-eng",
+        "parsed": parsed,
+        "analysis": analysis,
+        "pmf_matrix": matrix,
+        "resp_req": resp,
+    }
 
-    parsed_frames = []
-    for raw in SAMPLE_FRAMES:
-        frame_bytes = hex_to_bytes(raw["hex"])
-        parsed = parse_mgmt_frame(frame_bytes)
-        if parsed:
-            parsed["ts"] = raw["ts"]
-            parsed["label"] = raw["label"]
-            parsed_frames.append(parsed)
 
-    print(f"\n[+] Parsed {len(parsed_frames)} management frames from embedded dump\n")
-    for fr in parsed_frames:
-        reason = fr["reason_text"] if fr["reason_code"] is not None else "N/A"
-        print(f"  {fr['label']:30s}  subtype={fr['subtype']:10s}  "
-              f"src={fr['src_mac']}  dst={fr['dst_mac']}  "
-              f"reason={fr['reason_code']} ({reason})")
+def _show_report(result: dict, fh=sys.stdout) -> None:
+    a = result["analysis"]
+    print("=" * 66, file=fh)
+    print("W1 — Deauth/PMF Resilience Analysis & Deauth IDS", file=fh)
+    print("=" * 66, file=fh)
+    print(f"\n[+] Parsed {a['total_frames']} management frames (byte-exact, wifi=False)\n", file=fh)
+    for fr in result["parsed"]:
+        reason = fr.get("reason_text", "N/A")
+        print(f"  {fr['label']:26s} {fr['kind']:10s} src={fr['sa']}  "
+              f"dst={fr['da']}  reason={fr.get('reason_code')} ({reason})", file=fh)
 
-    print("\n--- Spoof-Heuristics Detection ---")
-    analysis = detect_spoof_heuristics(parsed_frames)
-    print(f"  Total frames:        {analysis['total_frames']}")
-    print(f"  Unique sources:      {analysis['unique_sources']}")
-    print(f"  Broadcast deauths:   {analysis['broadcast_count']}")
-    print(f"  Directed deauths:    {analysis['directed_count']}")
-    print(f"  Locally-admin MACs:  {analysis['locally_administered_count']}")
-    print(f"  Alerts generated:    {len(analysis['alerts'])}")
+    print("\n--- Spoof-Heuristics Detection ---", file=fh)
+    print(f"  Total frames:        {a['total_frames']}", file=fh)
+    print(f"  Unique sources:      {a['unique_sources']}", file=fh)
+    print(f"  Broadcast deauths:   {a['broadcast_count']}", file=fh)
+    print(f"  Directed deauths:    {a['directed_count']}", file=fh)
+    print(f"  Locally-admin MACs:  {a['locally_administered_count']}", file=fh)
+    print(f"  Alerts generated:    {len(a['alerts'])}", file=fh)
+    for alert in a["alerts"]:
+        print(f"\n  [!] {alert['type'].upper()}: {alert['detail']}", file=fh)
 
-    for alert in analysis["alerts"]:
-        print(f"\n  [!] {alert['type'].upper()}: {alert['detail']}")
+    print("\n--- PMF Resilience Matrix ---", file=fh)
+    print(f"  {'Posture':<32s} {'PMF':>9s} {'Resilience':>12s} {'respReq':>8s}", file=fh)
+    for posture, info in result["pmf_matrix"].items():
+        print(f"  {posture:<32s} {info['pmf']:>9s} {info['resilience']:>12s} "
+              f"{info['respReq']:>8d}", file=fh)
 
-    print("\n--- PMF Resilience Matrix ---")
-    matrix = build_pmf_matrix()
-    print(f"  {'Posture':<32s} {'PMF':>10s} {'Resilience':>12s} {'respReq':>8s}")
-    print(f"  {'-'*32} {'-'*10} {'-'*12} {'-'*8}")
-    for posture, info in matrix.items():
-        print(f"  {posture:<32s} {info['pmf']:>10s} {info['resilience']:>12s} {info['respReq']:>8d}")
+    print("\n--- respReq Categorization ---", file=fh)
+    for cat, postures in result["resp_req"].items():
+        print(f"  [{cat.upper()}] ({len(postures)}): {', '.join(postures) or '—'}", file=fh)
 
-    print("\n--- respReq Categorization ---")
-    resp_cats = categorize_resp_req(matrix)
-    for cat, postures in resp_cats.items():
-        print(f"  [{cat.upper()}] ({len(postures)} postures):")
-        for p in postures:
-            print(f"    - {p}")
+    print("\n--- Report Summary ---", file=fh)
+    print(f"  Deauth frames analyzed: {a['total_frames']}", file=fh)
+    print(f"  Total alerts:           {len(a['alerts'])}", file=fh)
+    print(f"  PMF postures cataloged: {len(result['pmf_matrix'])}", file=fh)
+    print(f"  Postures w/ respReq=1:  {len(result['resp_req']['required'])}/{len(result['pmf_matrix'])}", file=fh)
+    print("\nOffline demo complete — all checks passed.  No radio emitted.", file=fh)
+    print("=" * 66, file=fh)
 
-    print("\n--- Report Summary ---")
-    total_alerts = len(analysis["alerts"])
-    flood_alerts = sum(1 for a in analysis["alerts"] if a["type"] == "flood_rate")
-    mac_alerts = sum(1 for a in analysis["alerts"] if a["type"] == "randomized_mac")
-    print(f"  Deauth frames analyzed: {analysis['total_frames']}")
-    print(f"  Total alerts:           {total_alerts}")
-    print(f"  Flood-rate detections:  {flood_alerts}")
-    print(f"  MAC-randomization hints:{mac_alerts}")
-    print(f"  PMF postures cataloged: {len(matrix)}")
-    required_count = len(resp_cats.get("required", []))
-    print(f"  Postures w/ respReq=1:  {required_count}/{len(matrix)}")
-    print("\n" + "=" * 65)
-    print("Demo complete — all checks passed.")
-    print("=" * 65)
+
+def run_demo(output_report: bool = True) -> int:
+    frames = build_showcase_frames()
+    result = run_analysis(frames, build_pmf_matrix())
+    _show_report(result)
+    if output_report:
+        reports_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        path = os.path.join(reports_dir, "w1_deauth_eng_report.json")
+        with open(path, "w") as f:
+            json.dump(result, f, indent=2, default=str)
+        print(f"\n[+] JSON report -> reports/w1_deauth_eng_report.json")
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="w1-deauth-eng",
+        description="Deauth/disassociation 802.11 frame engineering + spoof analysis "
+                    "(pure-stdlib bytes; offline; no radio).")
+    parser.add_argument("--json", metavar="PATH",
+                        help="write JSON report to PATH (default reports/)")
+    parser.add_argument("--wifi", action="store_true",
+                        help="[SAFETY GATE] real-air emission. NOT implemented; must be False.")
+    parser.add_argument("--lab-ssid", default="lab-test-net", help="allow-listed lab SSID")
+    args = parser.parse_args(argv)
+    if args.wifi:
+        print("ERROR: real-air emission is not implemented (hardware gate). "
+              "This tool proves frame correctness offline only.", file=sys.stderr)
+        return 2
+    result = run_analysis(build_showcase_frames(), build_pmf_matrix())
+    _show_report(result)
+    if args.json:
+        d = os.path.dirname(args.json)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(args.json, "w") as f:
+            json.dump(result, f, indent=2, default=str)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(run_demo())
+    raise SystemExit(main())
