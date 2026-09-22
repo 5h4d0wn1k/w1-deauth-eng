@@ -1,6 +1,6 @@
 # ETHICS.md — Educational purpose and authorized use only
 
-**w1\-deauth\-eng** exists for **education, research, defense, and authorized testing**
+**w1-deauth-eng** exists for **education, research, defense, and authorized testing**
 — on systems you **own**, or for which you hold **explicit written authorization**
 defining scope and limits. It is not a toolkit for breaking into systems you do
 not control.
